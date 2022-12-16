@@ -89,32 +89,62 @@ private func send<Type, TypeLock>(
         return nil
     }
     
+    let debugTime = DispatchTime.now().uptimeNanoseconds
+    
     // Construct a GraphQL request.
     let request = createGraphQLRequest(
         selection: selection,
         operationName: operationName,
         url: url,
         headers: headers,
-        method: method
+        method: method,
+        debugTime: debugTime
     )
     
     // Create a completion handler.
     func onComplete(data: Data?, response: URLResponse?, error: Error?) {
+        
+        // Save the response or the error, depending on what's available
+        #if DEBUG
+        #if targetEnvironment(simulator)
+        let fallback = "\(String(describing: response))".data(using: .utf8) ?? "{'error': 'Could not serialize response'}".data(using: .utf8)!
+        let responeData: Data
+        if let data = data {
+            responeData = data
+        } else if let error = error {
+            responeData = "{'error': '\(error.localizedDescription)'}".data(using: .utf8)
+                ?? fallback
+        } else {
+            responeData = fallback
+        }
+        let url = URL(fileURLWithPath: "/tmp/query_response_\(debugTime).json")
+        try? responeData.write(to: url)
+        #endif
+        #endif
+        
         /* Process the response. */
         // Check for HTTP errors.
         if let error = error {
             return completionHandler(.failure(.network(error)))
         }
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200 ... 299).contains(httpResponse.statusCode)
-        else {
-            return completionHandler(.failure(.badstatus))
+        guard let httpResponse = response as? HTTPURLResponse else {
+            return completionHandler(.failure(.badstatus(nil)))
+        }
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            return completionHandler(.failure(.badstatus(httpResponse.statusCode)))
         }
 
         // Try to serialize the response.
-        if let data = data, let result = try? GraphQLResult(data, with: selection) {
-            return completionHandler(.success(result))
+        if let data = data {
+            do {
+                let result = try GraphQLResult(data, with: selection)
+                return completionHandler(.success(result))
+            } catch let error as HttpError {
+                return completionHandler(.failure(error))
+            } catch let error {
+                return completionHandler(.failure(.decodingError(error, extensions: nil)))
+            }
         }
 
         return completionHandler(.failure(.badpayload))
@@ -137,18 +167,24 @@ public enum HttpError: Error {
     case timeout
     case network(Error)
     case badpayload
-    case badstatus
+    case badstatus(Int?)
     case cancelled
+    case decodingError(Error, extensions: [String: AnyCodable]?)
+    case graphQLErrors([GraphQLError], extensions: [String: AnyCodable]?)
 }
 
 extension HttpError: Equatable {
     public static func == (lhs: SwiftGraphQL.HttpError, rhs: SwiftGraphQL.HttpError) -> Bool {
         // Equals if they are of the same type, different otherwise.
         switch (lhs, rhs) {
+        case (.badstatus(let a), .badstatus(let b)): return a == b
         case (.badURL, badURL),
-             (.timeout, .timeout),
-             (.badpayload, .badpayload),
-             (.badstatus, .badstatus):
+            (.timeout, .timeout),
+            (.badpayload, .badpayload),
+            (.cancelled, .cancelled),
+            (.network, .network),
+            (.decodingError, .decodingError),
+            (.graphQLErrors, .graphQLErrors):
             return true
         default:
             return false
@@ -183,7 +219,8 @@ private func createGraphQLRequest<Type, TypeLock>(
     operationName: String?,
     url: URL,
     headers: HttpHeaders,
-    method: HttpMethod
+    method: HttpMethod,
+    debugTime: UInt64
 ) -> URLRequest where TypeLock: GraphQLOperation & Decodable {
     // Construct a request.
     var request = URLRequest(url: url)
@@ -198,7 +235,19 @@ private func createGraphQLRequest<Type, TypeLock>(
     // Construct HTTP body.
     let encoder = JSONEncoder()
     let payload = selection.buildPayload(operationName: operationName)
-    request.httpBody = try! encoder.encode(payload)
+    
+    #if DEBUG
+    #if targetEnvironment(simulator)
+    // Write the query
+    try? payload.query.write(toFile: "/tmp/query_\(debugTime).graphql", atomically: true, encoding: .utf8)
+    // Write the variables
+    if let variables = try? encoder.encode(payload.variables) {
+        try? variables.write(to: URL(fileURLWithPath: "/tmp/query_variables_\(debugTime).json"))
+    }
+    #endif
+    #endif
+    let encoded = try! encoder.encode(payload)
+    request.httpBody = encoded
 
     return request
 }
